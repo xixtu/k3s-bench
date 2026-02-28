@@ -1,0 +1,138 @@
+---
+- name: Longhorn Live IO Diagnostics (Interactive)
+  hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    workdir: /tmp/bench-live
+
+  tasks:
+
+    #################################################################
+    # INSTALLATION OUTILS
+    #################################################################
+
+    - name: Install monitoring tools
+      package:
+        name:
+          - sysstat
+          - iotop
+          - ethtool
+        state: present
+      ignore_errors: yes
+
+    #################################################################
+    # PREPARATION
+    #################################################################
+
+    - name: Create working directory
+      file:
+        path: "{{ workdir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Capture baseline info
+      shell: |
+        echo "===== HOST =====" > {{ workdir }}/report.txt
+        hostname >> {{ workdir }}/report.txt
+        date >> {{ workdir }}/report.txt
+        uptime >> {{ workdir }}/report.txt
+        lscpu >> {{ workdir }}/report.txt
+        free -h >> {{ workdir }}/report.txt
+        lsblk -o NAME,SIZE,TYPE,MOUNTPOINT >> {{ workdir }}/report.txt
+      args:
+        executable: /bin/bash
+
+    #################################################################
+    # DEMARRAGE MONITORING EN CONTINU
+    #################################################################
+
+    - name: Start iostat in background
+      shell: |
+        nohup iostat -x 1 > {{ workdir }}/iostat.log 2>&1 &
+        echo $! > {{ workdir }}/iostat.pid
+      args:
+        executable: /bin/bash
+
+    - name: Start network monitoring in background
+      shell: |
+        nohup sar -n DEV 1 > {{ workdir }}/network.log 2>&1 &
+        echo $! > {{ workdir }}/network.pid
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    - name: Start CPU monitoring in background
+      shell: |
+        nohup mpstat -P ALL 1 > {{ workdir }}/cpu.log 2>&1 &
+        echo $! > {{ workdir }}/cpu.pid
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    #################################################################
+    # ATTENTE VALIDATION UTILISATEUR
+    #################################################################
+
+    - name: Monitoring running - press ENTER to stop
+      pause:
+        prompt: |
+          Monitoring is running on all nodes.
+          Launch your bench now.
+          Press ENTER when you want to stop data collection.
+
+    #################################################################
+    # STOP MONITORING PROPREMENT
+    #################################################################
+
+    - name: Stop monitoring processes
+      shell: |
+        for p in iostat network cpu; do
+          if [ -f {{ workdir }}/$p.pid ]; then
+            kill $(cat {{ workdir }}/$p.pid) 2>/dev/null || true
+          fi
+        done
+      args:
+        executable: /bin/bash
+
+    #################################################################
+    # COLLECT LONGHORN
+    #################################################################
+
+    - name: Collect Longhorn information
+      shell: |
+        kubectl get pods -n longhorn-system -o wide > {{ workdir }}/longhorn-pods.log 2>&1
+        kubectl get volumes.longhorn.io -A > {{ workdir }}/longhorn-volumes.log 2>&1
+        kubectl get replicas.longhorn.io -A > {{ workdir }}/longhorn-replicas.log 2>&1
+      ignore_errors: yes
+
+    #################################################################
+    # NIC DETAILS
+    #################################################################
+
+    - name: Capture NIC details
+      shell: |
+        for i in $(ls /sys/class/net | grep -v lo); do
+          echo "=== $i ===" >> {{ workdir }}/nic-details.log
+          ethtool $i >> {{ workdir }}/nic-details.log 2>&1
+        done
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    #################################################################
+    # ARCHIVE + FETCH
+    #################################################################
+
+    - name: Compress results
+      archive:
+        path: "{{ workdir }}"
+        dest: "{{ workdir }}/longhorn-live-{{ inventory_hostname }}.tar.gz"
+        format: gz
+
+    - name: Fetch results locally
+      fetch:
+        src: "{{ workdir }}/longhorn-live-{{ inventory_hostname }}.tar.gz"
+        dest: ./longhorn-live-reports/
+        flat: yes

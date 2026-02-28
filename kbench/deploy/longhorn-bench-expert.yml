@@ -1,0 +1,124 @@
+---
+- name: Longhorn Expert IO Diagnostics
+  hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    duration: 60
+    workdir: /tmp/bench-expert
+
+  tasks:
+
+    #################################################################
+    # INSTALLATION DES OUTILS
+    #################################################################
+
+    - name: Install monitoring tools
+      package:
+        name:
+          - sysstat
+          - iotop
+          - ethtool
+        state: present
+      ignore_errors: yes
+
+    #################################################################
+    # PREPARATION
+    #################################################################
+
+    - name: Create working directory
+      file:
+        path: "{{ workdir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Capture baseline system info
+      shell: |
+        echo "===== HOST =====" > {{ workdir }}/report.txt
+        hostname >> {{ workdir }}/report.txt
+
+        echo "===== DATE =====" >> {{ workdir }}/report.txt
+        date >> {{ workdir }}/report.txt
+
+        echo "===== UPTIME =====" >> {{ workdir }}/report.txt
+        uptime >> {{ workdir }}/report.txt
+
+        echo "===== CPU INFO =====" >> {{ workdir }}/report.txt
+        lscpu >> {{ workdir }}/report.txt
+
+        echo "===== MEMORY =====" >> {{ workdir }}/report.txt
+        free -h >> {{ workdir }}/report.txt
+
+        echo "===== BLOCK DEVICES =====" >> {{ workdir }}/report.txt
+        lsblk -o NAME,SIZE,TYPE,MOUNTPOINT >> {{ workdir }}/report.txt
+      args:
+        executable: /bin/bash
+
+    #################################################################
+    # MONITORING PARALLELE
+    #################################################################
+
+    - name: Start monitoring tasks in parallel
+      shell: "{{ item.cmd }}"
+      async: "{{ duration + 30 }}"
+      poll: 0
+      register: monitor_jobs
+      loop:
+        - { name: "iostat", cmd: "iostat -x 1 {{ duration }} > {{ workdir }}/iostat.log" }
+        - { name: "network", cmd: "sar -n DEV 1 {{ duration }} > {{ workdir }}/network.log" }
+        - { name: "cpu", cmd: "mpstat -P ALL 1 {{ duration }} > {{ workdir }}/cpu.log" }
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait for monitoring tasks to complete
+      async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: monitor_status
+      until: monitor_status.finished
+      retries: "{{ duration + 40 }}"
+      delay: 1
+      loop: "{{ monitor_jobs.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    #################################################################
+    # LONGHORN COLLECT
+    #################################################################
+
+    - name: Collect Longhorn cluster information
+      shell: |
+        kubectl get pods -n longhorn-system -o wide > {{ workdir }}/longhorn-pods.log 2>&1
+        kubectl get volumes.longhorn.io -A > {{ workdir }}/longhorn-volumes.log 2>&1
+        kubectl get replicas.longhorn.io -A > {{ workdir }}/longhorn-replicas.log 2>&1
+      ignore_errors: yes
+
+    #################################################################
+    # NETWORK DETAIL
+    #################################################################
+
+    - name: Capture NIC details
+      shell: |
+        for i in $(ls /sys/class/net | grep -v lo); do
+          echo "=== $i ===" >> {{ workdir }}/nic-details.log
+          ethtool $i >> {{ workdir }}/nic-details.log 2>&1
+        done
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    #################################################################
+    # ARCHIVE + FETCH
+    #################################################################
+
+    - name: Compress results
+      archive:
+        path: "{{ workdir }}"
+        dest: "{{ workdir }}/longhorn-expert-{{ inventory_hostname }}.tar.gz"
+        format: gz
+
+    - name: Fetch results locally
+      fetch:
+        src: "{{ workdir }}/longhorn-expert-{{ inventory_hostname }}.tar.gz"
+        dest: ./longhorn-reports/
+        flat: yes
